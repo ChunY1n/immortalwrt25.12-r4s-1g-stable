@@ -161,6 +161,8 @@ jobs:
           # 原因：dockerman 本体 + docker 引擎 + passwall(含 v2ray/xray/sing-box 等核心) +
           # homeproxy(sing-box) 三者叠加，软件包本身就接近 700-900MB，
           # 再加上日志、临时容器层、未来 opkg 升级留白，1024M 比较紧张，1536M 更稳妥。
+          # 本次新增 diskman/netdata/samba4 体积都不大（合计预估 <10MB），暂不调整分区，
+          # 如果后续编译/运行后发现空间紧张，再考虑调到 2048。
           # 如果你的 TF/eMMC 容量较小（例如 8G 卡），可以调回 1024。
           cat >> .config <<-EOF
           CONFIG_TARGET_KERNEL_PARTSIZE=32
@@ -173,6 +175,35 @@ jobs:
           CONFIG_PACKAGE_luci-app-passwall=y
           CONFIG_PACKAGE_luci-app-homeproxy=y
           CONFIG_PACKAGE_luci-app-upnp=y
+          EOF
+
+          # ── 3.1 磁盘管理 diskman（管理内置 eMMC/SD 卡分区）──
+          # 官方预编译仓库里以下4个内核模块在 rockchip/armv8 这个 target 不提供（kmod-fs-msdos
+          # 和3个NLS codepage），apk/opkg 直接装会因依赖缺失报错，源码编译时显式选中即可正常编出。
+          # 其余 diskman 标准依赖（blkid/parted/lsblk/dosfstools/e2fsprogs/exfat-fsck/exfat-mkfs/
+          # smartmontools）官方仓库本身就有，feeds 依赖解析会自动带上，这里不用手写。
+          cat >> .config <<-EOF
+          CONFIG_PACKAGE_luci-app-diskman=y
+          CONFIG_PACKAGE_luci-i18n-diskman-zh-cn=y
+          CONFIG_PACKAGE_kmod-fs-msdos=y
+          CONFIG_PACKAGE_kmod-nls-cp932=y
+          CONFIG_PACKAGE_kmod-nls-cp936=y
+          CONFIG_PACKAGE_kmod-nls-cp950=y
+          EOF
+
+          # ── 3.2 系统监控 netdata ──
+          cat >> .config <<-EOF
+          CONFIG_PACKAGE_luci-app-netdata=y
+          CONFIG_PACKAGE_netdata=y
+          CONFIG_PACKAGE_luci-i18n-netdata-zh-cn=y
+          EOF
+
+          # ── 3.3 NAS共享 samba4 ──
+          # 注意：你选的是"diskman管理内置eMMC/SD卡分区"，samba4本身不挑存储介质，
+          # 装好后照样可以把SD卡上的某个分区共享出去，二者互不冲突。
+          cat >> .config <<-EOF
+          CONFIG_PACKAGE_luci-app-samba4=y
+          CONFIG_PACKAGE_luci-i18n-samba4-zh-cn=y
           EOF
 
           # ── 4. GC404 系优化：网络性能与转发效率 ──
@@ -203,6 +234,16 @@ jobs:
           EOF
 
           make defconfig
+
+      - name: 核对本次新增插件是否选中成功
+        working-directory: ./openwrt
+        run: |
+          echo "---- diskman 相关 ----"
+          grep -E "luci-app-diskman|luci-i18n-diskman|kmod-fs-msdos|kmod-nls-cp9" .config || echo "(未匹配到，请检查上面 .config 写入是否出错)"
+          echo "---- netdata 相关 ----"
+          grep -E "luci-app-netdata|CONFIG_PACKAGE_netdata=y|luci-i18n-netdata" .config || echo "(未匹配到)"
+          echo "---- samba4 相关 ----"
+          grep -E "luci-app-samba4|luci-i18n-samba4" .config || echo "(未匹配到)"
 
       - name: Download packages
         working-directory: ./openwrt
@@ -239,7 +280,11 @@ jobs:
           cd bin/targets/*/*
           IMG=$(ls *-squashfs-sysupgrade.img.gz 2>/dev/null | head -1 || true)
           if [ -n "$IMG" ]; then
-            echo "固件大小：$(du -h "$IMG" | cut -f1)"
+            SIZE_MB=$(du -m "$IMG" | cut -f1)
+            echo "固件大小：${SIZE_MB}M（rootfs 分区上限 1536M，压缩前的实际占用请刷机后在 LuCI 系统状态里看 df -h）"
+            if [ "$SIZE_MB" -gt 1200 ]; then
+              echo "::warning::固件压缩包已超过 1200M，加上后续 opkg/apk 升级和容器层占用，1536M 分区可能会比较紧张，建议关注"
+            fi
           fi
 
       - name: Organize output files and generate Tag
@@ -261,13 +306,16 @@ jobs:
             - **设备**: NanoPi R4S (1G 内存版本)
             - **源码分支**: [ImmortalWrt ${{ env.REPO_BRANCH }}](${{ env.REPO_URL }}/tree/${{ env.REPO_BRANCH }})（稳定版分支，非 master 开发版）
             - **构建 Commit**: [`${{ env.SOURCE_COMMIT }}`](${{ env.REPO_URL }}/commit/${{ env.SOURCE_COMMIT_FULL }})
-            - **RootFS 空间**: 1536 MB（为 Docker + 三大插件预留充足空间）
+            - **RootFS 空间**: 1536 MB（维持不变）
 
             ## 📦 已集成插件
             - 🐳 `luci-app-dockerman`（含 Docker 引擎）
             - 🛡️ `luci-app-passwall`
             - 🚀 `luci-app-homeproxy`
             - 🔌 `luci-app-upnp`
+            - 💾 `luci-app-diskman`（磁盘/分区管理，含官方仓库未提供的 kmod-fs-msdos、kmod-nls-cp932/936/950，源码编译解决依赖缺失问题）
+            - 📊 `luci-app-netdata`（系统监控）
+            - 🗂️ `luci-app-samba4`（NAS 文件共享）
             - 🖥️ `luci-app-ttyd`（网页终端）
             - 📟 `luci-app-watchdog`
 
