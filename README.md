@@ -66,20 +66,6 @@ schedule:
   - cron: '0 18 * * *'   # 改检查频率，默认每天一次
 ```
 
-## ❓ 常见问题
-
-**Q: 为什么 Actions 跑完了但没有出新 Release？**
-A: 正常情况，说明上游源码没有新提交，自动跳过了编译这一步（查看 Actions 日志里的 `check-update` 任务，会写明跳过原因）。
-
-**Q: 编译失败怎么排查？**
-A: 编译失败时会自动把日志打包成 Artifact，在对应的 Actions 运行记录页面底部 "Artifacts" 里下载查看。
-
-**Q: 想换成 R2S / 其他设备怎么办？**
-A: 改 `.config` 生成那一步里的 `CONFIG_TARGET_*` 几行，具体型号代码可以在 [ImmortalWrt Firmware Selector](https://firmware-selector.immortalwrt.org/) 里搜设备名确认。
-
-**Q: 1536MB 的空间够用吗？**
-A: dockerman + passwall + homeproxy 三者软件包本身接近 700-900MB，1536MB 留了较充足的余量；如果后续还想装更多插件或拉取较大的 Docker 镜像，可以考虑刷完后用 `resize2fs` 之类工具扩容实际分区（取决于你的存储介质容量）。
-
 ## 📜 致谢
 
 固件基于 [ImmortalWrt](https://github.com/immortalwrt/immortalwrt) 官方源码编译，部分网络优化思路参考自 R2S/R4S 社区（天灵 / GC 等）长期沿用的常见配置。
