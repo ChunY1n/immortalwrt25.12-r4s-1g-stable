@@ -313,23 +313,28 @@ jobs:
       - name: Download packages
         working-directory: ./openwrt
         run: |
+          # 注意：体积检查只扫描 dl/ 顶层（-maxdepth 1），不能递归进子目录！
+          # dl/go-mod-cache/ 等子目录是 go mod download 拉取的完整模块源码树，
+          # 里面天然存在大量几十字节的正常小文件（LICENSE、.gitignore、单测用的
+          # golden 文件等），如果不限制深度会把这些正常文件误判成"下载不完整"
+          # 并删除，反而把本来能成功的构建搞挂。
           for i in 1 2 3; do
             make download -j8 && break
             echo "第 $i 次下载未完全成功，清理可疑文件后重试..."
-            find dl -size -1024c -exec rm -f {} \;
+            find dl -maxdepth 1 -type f -size -1024c -exec rm -f {} \;
             sleep 10
           done
           make download -j1
 
-          # 找出体积异常（<1KB，通常是下载中断/服务器返回错误页）的文件，
-          # 打印出具体文件名方便定位，再补一次下载；仍失败才真正报错终止
-          BAD_FILES=$(find dl -size -1024c -type f)
+          # 只检查 dl/ 顶层的包归档文件（.tar.gz/.zip/.tar.xz 等），体积异常
+          # （<1KB，通常是网络中断/上游返回了错误页）大概率意味着下载不完整
+          BAD_FILES=$(find dl -maxdepth 1 -type f -size -1024c)
           if [ -n "$BAD_FILES" ]; then
             echo "::warning::以下文件体积异常（<1KB），可能下载不完整，正在清理重试："
             echo "$BAD_FILES"
             echo "$BAD_FILES" | xargs -r rm -f
             make download -j1
-            STILL_BAD=$(find dl -size -1024c -type f)
+            STILL_BAD=$(find dl -maxdepth 1 -type f -size -1024c)
             if [ -n "$STILL_BAD" ]; then
               echo "::error::以下文件多次尝试后仍然异常，请检查网络或上游源是否失效："
               echo "$STILL_BAD"
