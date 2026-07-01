@@ -112,7 +112,7 @@ jobs:
             gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev \
             python3-distutils python3-pip python3-pyelftools python3-setuptools \
             swig rsync unzip zlib1g-dev file wget curl
-          
+
           # 确保通过 pip 再次兜底安装 pyelftools 以防 u-boot 检查失败
           sudo -E pip3 install --upgrade pyelftools
           python3 -c "import elftools; print('pyelftools OK:', elftools.__file__)"
@@ -167,6 +167,10 @@ jobs:
         run: |
           ./scripts/feeds update -a
           ./scripts/feeds install -a
+          # jjm2473 feed 里的 luci-app-tasks 依赖 luci-lib-taskd（属于另一个
+          # 未引入的 istore feed），我们只需要这个 feed 里的 homebox，不需要
+          # luci-app-tasks，卸载掉以消除 "dependency ... does not exist" 警告
+          ./scripts/feeds uninstall luci-app-tasks 2>/dev/null || true
 
       - name: Generate custom configuration
         working-directory: ./openwrt
@@ -316,7 +320,23 @@ jobs:
             sleep 10
           done
           make download -j1
-          find dl -size -1024c | grep -q . && echo "::warning::仍有部分包体积异常，请检查日志" || echo "所有包下载完整"
+
+          # 找出体积异常（<1KB，通常是下载中断/服务器返回错误页）的文件，
+          # 打印出具体文件名方便定位，再补一次下载；仍失败才真正报错终止
+          BAD_FILES=$(find dl -size -1024c -type f)
+          if [ -n "$BAD_FILES" ]; then
+            echo "::warning::以下文件体积异常（<1KB），可能下载不完整，正在清理重试："
+            echo "$BAD_FILES"
+            echo "$BAD_FILES" | xargs -r rm -f
+            make download -j1
+            STILL_BAD=$(find dl -size -1024c -type f)
+            if [ -n "$STILL_BAD" ]; then
+              echo "::error::以下文件多次尝试后仍然异常，请检查网络或上游源是否失效："
+              echo "$STILL_BAD"
+              exit 1
+            fi
+          fi
+          echo "所有包下载完整"
 
       - name: Compile the firmware
         id: compile
