@@ -106,12 +106,14 @@ jobs:
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
+          # 仅清理大文件，不再盲目执行 rm -rf /etc/apt/sources.list.d/* 以免丢失官方软件源
           sudo -E apt-get -qq update
-          sudo -E apt-get -qq install build-essential clang flex bison g++ gawk \
+          sudo -E apt-get -qq install -y build-essential clang flex bison g++ gawk \
             gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev \
             python3-distutils python3-pip python3-pyelftools python3-setuptools \
             swig rsync unzip zlib1g-dev file wget curl
-          # apt 的 python3-pyelftools 才是 OpenWrt prereq.mk 实际检测的包；pip 仅作兜底
+          
+          # 确保通过 pip 再次兜底安装 pyelftools 以防 u-boot 检查失败
           sudo -E pip3 install --upgrade pyelftools
           python3 -c "import elftools; print('pyelftools OK:', elftools.__file__)"
           sudo timedatectl set-timezone "$TZ"
@@ -122,6 +124,13 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "14"
+
+      - name: Setup Go Environment
+        # 解决 homebox 后端构建时 `go: command not found` 的错误
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: false
 
       - name: Clone ImmortalWrt source code
         run: git clone --depth 1 $REPO_URL -b $REPO_BRANCH openwrt
@@ -173,12 +182,6 @@ jobs:
 
           # ── 2. 分区大小：1G 设备的合理分配 ──
           # kernel 分区 32M 足够；rootfs 给到 1536M（约 1.5GB ext4 可用空间）
-          # 原因：dockerman 本体 + docker 引擎 + passwall(含 v2ray/xray/sing-box 等核心) +
-          # homeproxy(sing-box) 三者叠加，软件包本身就接近 700-900MB，
-          # 再加上日志、临时容器层、未来 opkg 升级留白，1024M 比较紧张，1536M 更稳妥。
-          # diskman/netdata/samba4/homebox 体积都不大（合计预估 <20MB），暂不调整分区，
-          # 如果后续编译/运行后发现空间紧张，再考虑调到 2048。
-          # 如果你的 TF/eMMC 容量较小（例如 8G 卡），可以调回 1024。
           cat >> .config <<-EOF
           CONFIG_TARGET_KERNEL_PARTSIZE=32
           CONFIG_TARGET_ROOTFS_PARTSIZE=1536
@@ -195,12 +198,6 @@ jobs:
           EOF
 
           # ── 3.0 基础/系统预装包 ──
-          # 以下大部分本来就是 friendlyarm_nanopi-r4s 这个 device profile 的默认
-          # DEVICE_PACKAGES（base-files/libc/netifd/fstools等核心包），显式写出来
-          # 主要是当保险栓，防止上游以后改默认值时漏掉；重复选中不会有副作用。
-          # 额外注意：R4S 的两个网口驱动不一样 —— 片内GMAC接口走 kmod-r8169(配合PHY)，
-          # USB3.0转千兆的第二个口实际是 Realtek RTL8153 芯片，需要 kmod-usb-net-rtl8152
-          # 才能用，原列表里没有这个会导致刷机后只有一个网口能工作，这里额外补上。
           cat >> .config <<-EOF
           CONFIG_PACKAGE_apk-openssl=y
           CONFIG_PACKAGE_autocore=y
@@ -242,11 +239,7 @@ jobs:
           CONFIG_PACKAGE_kmod-usb-net-rtl8152=y
           EOF
 
-          # ── 3.1 磁盘管理 diskman（管理内置 eMMC/SD 卡分区）──
-          # 官方预编译仓库里以下4个内核模块在 rockchip/armv8 这个 target 不提供（kmod-fs-msdos
-          # 和3个NLS codepage），apk/opkg 直接装会因依赖缺失报错，源码编译时显式选中即可正常编出。
-          # 其余 diskman 标准依赖（blkid/parted/lsblk/dosfstools/e2fsprogs/exfat-fsck/exfat-mkfs/
-          # smartmontools）官方仓库本身就有，feeds 依赖解析会自动带上，这里不用手写。
+          # ── 3.1 磁盘管理 diskman ──
           cat >> .config <<-EOF
           CONFIG_PACKAGE_luci-app-diskman=y
           CONFIG_PACKAGE_luci-i18n-diskman-zh-cn=y
@@ -264,26 +257,17 @@ jobs:
           EOF
 
           # ── 3.3 NAS共享 samba4 ──
-          # 注意：你选的是"diskman管理内置eMMC/SD卡分区"，samba4本身不挑存储介质，
-          # 装好后照样可以把SD卡上的某个分区共享出去，二者互不冲突。
           cat >> .config <<-EOF
           CONFIG_PACKAGE_luci-app-samba4=y
           CONFIG_PACKAGE_luci-i18n-samba4-zh-cn=y
           EOF
 
           # ── 3.4 homebox 编译关键开关 ──
-          # homebox 的 Makefile 依赖 host 编译产物（前端 build/static）在 target
-          # 编译阶段还存在，但 AUTOREMOVE 会在 host-compile 完成后立刻清空
-          # build_dir/hostpkg/homebox，不关掉这个选项 100% 会在 cp build/static 这一步报错。
           cat >> .config <<-EOF
           # CONFIG_AUTOREMOVE is not set
           EOF
 
-          # ── 4. GC404 系优化：网络性能与转发效率 ──
-          # 这些是 R2S/R4S 社区圈（天灵/GC/QC）长期沿用的一组标准优化项：
-          # - Flow Offloading（软件层快速转发）+ Full Cone NAT：显著降低 NAT 后跑游戏/P2P 的延迟和连接问题
-          # - BBR 拥塞控制：替换默认 cubic，高延迟/弱网链路下吞吐更稳定
-          # - 关闭不必要的 IPv6 隧道安装脚本，减小固件体积（如需 IPv6 可自行在 LuCI 里启用 odhcp6c）
+          # ── 4. 网络性能与转发效率优化 ──
           cat >> .config <<-EOF
           CONFIG_PACKAGE_kmod-nf-nathelper=y
           CONFIG_PACKAGE_kmod-nf-nathelper-extra=y
@@ -293,7 +277,7 @@ jobs:
           CONFIG_PACKAGE_irqbalance=y
           EOF
 
-          # ── 5. 实用工具（GC404 类固件常见标配，体积很小但很常用）──
+          # ── 5. 实用工具与中文包 ──
           cat >> .config <<-EOF
           CONFIG_PACKAGE_luci-app-ttyd=y
           CONFIG_PACKAGE_luci-app-watchdog=y
@@ -312,15 +296,15 @@ jobs:
         working-directory: ./openwrt
         run: |
           echo "---- diskman 相关 ----"
-          grep -E "luci-app-diskman|luci-i18n-diskman|kmod-fs-msdos|kmod-nls-cp9" .config || echo "(未匹配到，请检查上面 .config 写入是否出错)"
+          grep -E "luci-app-diskman|luci-i18n-diskman|kmod-fs-msdos|kmod-nls-cp9" .config || echo "(未匹配到)"
           echo "---- netdata 相关 ----"
           grep -E "luci-app-netdata|CONFIG_PACKAGE_netdata=y|luci-i18n-netdata" .config || echo "(未匹配到)"
           echo "---- samba4 相关 ----"
           grep -E "luci-app-samba4|luci-i18n-samba4" .config || echo "(未匹配到)"
           echo "---- homebox 相关 ----"
-          grep -E "CONFIG_PACKAGE_homebox=y|CONFIG_PACKAGE_luci-app-homebox=y|CONFIG_AUTOREMOVE" .config || echo "(未匹配到，请检查上面 .config 写入是否出错)"
-          echo "---- 两个网口驱动是否都选上 (r8169 + USB3的rtl8152) ----"
-          grep -E "CONFIG_PACKAGE_kmod-r8169=y|CONFIG_PACKAGE_kmod-usb-net-rtl8152=y" .config || echo "(未匹配到，注意第二个USB千兆口可能无法使用)"
+          grep -E "CONFIG_PACKAGE_homebox=y|CONFIG_PACKAGE_luci-app-homebox=y|CONFIG_AUTOREMOVE" .config || echo "(未匹配到)"
+          echo "---- 两个网口驱动 (r8169 + rtl8152) ----"
+          grep -E "CONFIG_PACKAGE_kmod-r8169=y|CONFIG_PACKAGE_kmod-usb-net-rtl8152=y" .config || echo "(未匹配到)"
 
       - name: Download packages
         working-directory: ./openwrt
@@ -345,7 +329,7 @@ jobs:
         run: |
           STATIC_DIR=$(find build_dir/hostpkg -maxdepth 4 -type d -path "*homebox*/build/static" | head -n1)
           if [ -z "$STATIC_DIR" ]; then
-            echo "::warning::没找到 homebox 前端 build/static，luci-app-homebox 界面可能不完整，请检查上面编译日志中 npm run build / parcel 的输出"
+            echo "::warning::没找到 homebox 前端 build/static"
           else
             echo "OK: $STATIC_DIR"
             ls "$STATIC_DIR"
@@ -364,15 +348,11 @@ jobs:
       - name: Check rootfs usage (warn if near full)
         working-directory: ./openwrt
         run: |
-          # 编译完成后检查一下实际生成的 rootfs 占用比例，提前预警空间是否够用
           cd bin/targets/*/*
           IMG=$(ls *-squashfs-sysupgrade.img.gz 2>/dev/null | head -1 || true)
           if [ -n "$IMG" ]; then
             SIZE_MB=$(du -m "$IMG" | cut -f1)
-            echo "固件大小：${SIZE_MB}M（rootfs 分区上限 1536M，压缩前的实际占用请刷机后在 LuCI 系统状态里看 df -h）"
-            if [ "$SIZE_MB" -gt 1200 ]; then
-              echo "::warning::固件压缩包已超过 1200M，加上后续 opkg/apk 升级和容器层占用，1536M 分区可能会比较紧张，建议关注"
-            fi
+            echo "固件大小：${SIZE_MB}M"
           fi
 
       - name: Organize output files and generate Tag
@@ -392,29 +372,22 @@ jobs:
           body: |
             ## 🔄 自动检测更新并编译
             - **设备**: NanoPi R4S (1G 内存版本)
-            - **源码分支**: [ImmortalWrt ${{ env.REPO_BRANCH }}](${{ env.REPO_URL }}/tree/${{ env.REPO_BRANCH }})（稳定版分支，非 master 开发版）
+            - **源码分支**: [ImmortalWrt ${{ env.REPO_BRANCH }}](${{ env.REPO_URL }}/tree/${{ env.REPO_BRANCH }})
             - **构建 Commit**: [`${{ env.SOURCE_COMMIT }}`](${{ env.REPO_URL }}/commit/${{ env.SOURCE_COMMIT_FULL }})
-            - **RootFS 空间**: 1536 MB（维持不变）
+            - **RootFS 空间**: 1536 MB
 
             ## 📦 已集成插件
-            - 🐳 `luci-app-dockerman`（含 Docker 引擎）
+            - 🐳 `luci-app-dockerman`
             - 🛡️ `luci-app-passwall`
             - 🚀 `luci-app-homeproxy`
             - 🔌 `luci-app-upnp`
-            - 💾 `luci-app-diskman`（磁盘/分区管理，含官方仓库未提供的 kmod-fs-msdos、kmod-nls-cp932/936/950，源码编译解决依赖缺失问题）
-            - 📊 `luci-app-netdata`（系统监控）
-            - 🗂️ `luci-app-samba4`（NAS 文件共享）
-            - 🏠 `luci-app-homebox`（家庭物品管理，来自 jjm2473/openwrt-apps feed 源码编译）
-            - 🖥️ `luci-app-ttyd`（网页终端）
-            - 📟 `luci-app-watchdog`
+            - 💾 `luci-app-diskman`
+            - 📊 `luci-app-netdata`
+            - 🗂️ `luci-app-samba4`
+            - 🏠 `luci-app-homebox`
+            - 🖥️ `luci-app-ttyd`
 
-            ## ⚙️ 网络优化（参考天灵/GC社区常见配置）
-            - Flow Offloading + Full Cone NAT
-            - BBR 拥塞控制算法
-            - irqbalance 多核中断均衡
-            - 中文语言包预装
-
-            💡 **刷写说明**: 全新刷写下载 `squashfs-sysupgrade.img.gz`；在线升级请在 LuCI 的系统→备份升级中上传同一文件，并视情况选择是否保留配置。
+            💡 **刷写说明**: 全新刷写下载 `squashfs-sysupgrade.img.gz`。
           files: |
             ${{ env.FIRMWARE }}/*.img.gz
             ${{ env.FIRMWARE }}/*sha256sums*
